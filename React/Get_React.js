@@ -146,33 +146,85 @@
         }
     }
 
-    // ===== RouterProvider模式检测 =====
+    // ===== RouterProvider模式检测（v6 data router）=====
     // 对应 React Router v6 的 createBrowserRouter + <RouterProvider router={router} />
-    // router 对象挂在 props.router 上，且有 routes 数组
+    // v6 data router 有专属方法 navigate / subscribe，v3/v4 router 没有
     function isRouterProvider(props) {
         if (!props || typeof props !== 'object') return false;
         const router = props.router;
         if (!router || typeof router !== 'object') return false;
         if (!Array.isArray(router.routes)) return false;
+        // v6 data router 必有 navigate 方法；v3/v4 router 没有（用 push/transitionTo）
+        // 这是区分两者最可靠的特征
+        if (typeof router.navigate !== 'function') return false;
         if (router.routes.length === 0) return true;
-        // 验证 routes 数组内容符合路由对象结构
         return router.routes.some(r =>
             r && typeof r === 'object' && ('path' in r || 'children' in r || 'id' in r)
         );
     }
 
+    // ===== 判断一个 router 对象是否为 v3/v4 style（history-like）=====
+    function isLegacyRouterObject(router) {
+        if (!router || typeof router !== 'object') return false;
+        if (!Array.isArray(router.routes) || router.routes.length === 0) return false;
+        // v3/v4 router 的专属方法
+        if (typeof router.getCurrentLocation === 'function' ||
+            typeof router.transitionTo === 'function' ||
+            typeof router.listenBefore === 'function') {
+            return true;
+        }
+        // 或者 routes 数组中含有 v3/v4 专有字段
+        return router.routes.some(r =>
+            r && typeof r === 'object' && ('childRoutes' in r || 'getComponent' in r || 'indexRoute' in r)
+        );
+    }
+
+    // ===== React Router v3/v4 Legacy 模式检测 =====
+    // 两种存放位置：
+    //   1. props.routes（直接是路由数组）
+    //   2. props.router.routes（routes 挂在 history-like 的 router 对象上）
+    function isLegacyRouterRoutes(props) {
+        if (!props || typeof props !== 'object') return false;
+
+        // Case 1: props.routes 直接是路由数组
+        if (Array.isArray(props.routes) && props.routes.length > 0) {
+            if (props.routes.some(r =>
+                r && typeof r === 'object' && 'path' in r &&
+                ('component' in r || 'getComponent' in r || 'childRoutes' in r || 'indexRoute' in r)
+            )) return true;
+        }
+
+        // Case 2: props.router 是 v3/v4 history-like router，routes 在其上
+        if (isLegacyRouterObject(props.router)) return true;
+
+        return false;
+    }
+
+    // ===== 从检测到的 props 中提取 v3/v4 routes 数组 =====
+    function getLegacyRoutes(props) {
+        if (Array.isArray(props.routes) && props.routes.length > 0) return props.routes;
+        if (isLegacyRouterObject(props.router)) return props.router.routes;
+        return [];
+    }
+
     // ===== JSX <Routes>/<Route> 模式检测 =====
-    // 对应 React Router v6 的 JSX 写法：<Routes><Route path="/" element={...} /></Routes>
+    // 对应 React Router v5/v6 的 JSX 写法：<Routes><Route path="/" element={...} /></Routes>
     // 路由信息分散在各个 React Element 的 props 里
     function isRouteElement(el) {
         if (!el || typeof el !== 'object') return false;
         const p = el.props;
         if (!p || typeof p !== 'object') return false;
+        // 必须有 path（字符串）或 index（布尔，代表默认子路由）
+        const hasPath = typeof p.path === 'string';
+        const hasIndex = p.index === true;
+        if (!hasPath && !hasIndex) return false;
+        // 必须同时具备 element / component / render / children 之一
+        // 防止把带有 path prop 的普通组件（Link、面包屑等）误判为 Route
         return (
-            typeof p.path === 'string' ||
-            'element' in p ||
-            'component' in p ||
-            ('render' in p && typeof p.render === 'function')
+            p.element !== undefined ||
+            typeof p.component === 'function' ||
+            typeof p.render === 'function' ||
+            p.children !== undefined
         );
     }
 
@@ -190,16 +242,23 @@
     }
 
     // ===== Phase 2: Fiber树BFS扫描，寻找Router实例 =====
-    // 关键策略：只沿 child 和 sibling 导航，
-    // 绝不进入 stateNode、memoizedState、return、alternate 等属性，
-    // 防止溢出到DOM树或触发循环引用。
+    // 导航策略：只沿 child 和 sibling 前进，绝不将 alternate 加入队列。
+    // 额外读取 fiber.alternate 的 props（不遍历其子树），
+    // 应对路由数据仅存在于 alternate fiber 上的情况。
+    //
+    // 返回优先级策略（从高到低）：
+    //   RouterProvider → 立即返回（最可靠，特征极明确）
+    //   LegacyRoutes   → 立即返回（可靠，有 routes 数组且带框架特有字段）
+    //   JSX Routes     → 仅作候选，继续扫完整棵树后若无更好结果才返回
+    //                   （最易误判，普通组件的 children 也可能满足条件）
     function findRouterInFiber(startFiber) {
         if (!startFiber) return null;
 
         const queue = [startFiber];
         const visited = new WeakSet();
-        const MAX_NODES = 3000; // 安全上限，防止超大应用卡死
+        const MAX_NODES = 3000;
         let count = 0;
+        let jsxRoutesCandidate = null; // JSX Routes 命中时不立刻返回，保存为候选
 
         while (queue.length > 0 && count < MAX_NODES) {
             const fiber = queue.shift();
@@ -209,35 +268,73 @@
             if (visited.has(fiber)) continue;
             visited.add(fiber);
 
-            // 只检测 memoizedProps（最终态）和 pendingProps（渲染中）
-            // 不遍历fiber的其他任何属性
-            for (const key of ['memoizedProps', 'pendingProps']) {
-                const props = fiber[key];
+            // 收集需要检测的 props 来源：
+            // 1. 当前 fiber 的 memoizedProps / pendingProps
+            // 2. alternate fiber 的 memoizedProps / pendingProps
+            //    （路由数据有时仅存于 alternate，不加入队列只读其 props）
+            const propsSources = [fiber.memoizedProps, fiber.pendingProps];
+            const alt = fiber.alternate;
+            if (alt && alt !== fiber && !visited.has(alt)) {
+                propsSources.push(alt.memoizedProps, alt.pendingProps);
+            }
+
+            for (const props of propsSources) {
                 if (!props || typeof props !== 'object') continue;
 
-                // 优先检测 RouterProvider 模式
+                // RouterProvider：立即返回，特征最明确
                 if (isRouterProvider(props)) {
                     return { type: 'RouterProvider', router: props.router };
                 }
-
-                // 再检测 JSX Routes 模式
-                if (isRoutesComponent(props)) {
-                    return { type: 'Routes', props };
+                // LegacyRoutes：立即返回，v3/v4 特有结构
+                if (isLegacyRouterRoutes(props)) {
+                    return { type: 'LegacyRoutes', routes: getLegacyRoutes(props) };
+                }
+                // JSX Routes：仅保存第一个命中，继续扫描不返回
+                // 避免因浅层误判提前退出，错过更深处的真实路由
+                if (!jsxRoutesCandidate && isRoutesComponent(props)) {
+                    jsxRoutesCandidate = { type: 'Routes', props };
                 }
             }
 
-            // 严格只走Fiber树的两条导航链路，绝不访问其他属性
+            // 严格只走Fiber树导航链路
             if (fiber.child) queue.push(fiber.child);
             if (fiber.sibling) queue.push(fiber.sibling);
         }
 
         if (count >= MAX_NODES) {
             console.warn('[AntiDebug] ⚠️ Fiber树遍历达到上限（3000节点），可能未完整扫描');
-        } else {
+        } else if (!jsxRoutesCandidate) {
             console.log(`[AntiDebug] Fiber树遍历完毕，共访问 ${count} 个节点，未找到Router`);
         }
 
-        return null;
+        // RouterProvider / LegacyRoutes 未找到，用 JSX Routes 候选兜底（可能为误判）
+        return jsxRoutesCandidate || null;
+    }
+
+    // ===== 路由提取：React Router v3/v4 Legacy 模式 =====
+    // 路由结构：{ path, name, component/getComponent, childRoutes, indexRoute }
+    // 子路由字段是 childRoutes（不是 children）
+    function extractLegacyRoutes(routes, prefix) {
+        prefix = prefix || '';
+        const list = [];
+        if (!Array.isArray(routes)) return list;
+
+        for (const route of routes) {
+            if (!route || typeof route !== 'object') continue;
+            if (typeof route.path !== 'string') continue;
+
+            const fullPath = joinPath(prefix, route.path);
+            list.push({
+                name: route.name || '(unnamed)',
+                path: fullPath
+            });
+
+            // 递归处理 childRoutes（v3/v4 的嵌套路由字段）
+            if (Array.isArray(route.childRoutes) && route.childRoutes.length > 0) {
+                list.push(...extractLegacyRoutes(route.childRoutes, fullPath));
+            }
+        }
+        return list;
     }
 
     // ===== 路由提取：RouterProvider模式 =====
@@ -324,6 +421,11 @@
                 console.log(`\n📋 React Router 路由列表 [RouterProvider - ${mode} 模式]：`);
                 console.table(routes.map(r => ({ Name: r.name, Path: r.path })));
                 console.log('\n🔗 Router 实例：', result.router);
+            } else if (result.type === 'LegacyRoutes') {
+                const routes = extractLegacyRoutes(result.routes);
+                console.log('\n📋 React Router 路由列表 [v3/v4 Legacy 模式]：');
+                console.table(routes.map(r => ({ Name: r.name, Path: r.path })));
+                console.log('\n🔗 原始 routes：', result.routes);
             } else {
                 const routes = extractJSXRoutes(result.props);
                 console.log('\n📋 React Router 路由列表 [JSX <Routes> 模式]：');

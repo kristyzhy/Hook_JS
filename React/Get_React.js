@@ -210,21 +210,33 @@
     // ===== JSX <Routes>/<Route> 模式检测 =====
     // 对应 React Router v5/v6 的 JSX 写法：<Routes><Route path="/" element={...} /></Routes>
     // 路由信息分散在各个 React Element 的 props 里
+    //
+    // 注意：这里使用宽松的 OR 逻辑，而非严格的 AND 逻辑。
+    // 原因：v6 支持多种合法 Route 写法——
+    //   ① path-only：<Route path="/about" />（无 element，渲染 null）
+    //   ② lazy：<Route path="/home" lazy={() => import('./Home')} />（无 element）
+    //   ③ layout route：<Route element={<Layout/>}>（无 path，包裹子路由）
+    //   ④ index route：<Route index element={<Home/>} />（无 path）
+    // 严格要求 path + element/component 会误杀这些合法情况。
+    // 潜在假阳性（如普通组件带 path prop）由两阶段策略兜底：
+    // JSX Routes 仅保存为候选，LegacyRoutes / RouterProvider 优先立刻返回。
     function isRouteElement(el) {
         if (!el || typeof el !== 'object') return false;
         const p = el.props;
         if (!p || typeof p !== 'object') return false;
-        // 必须有 path（字符串）或 index（布尔，代表默认子路由）
-        const hasPath = typeof p.path === 'string';
-        const hasIndex = p.index === true;
-        if (!hasPath && !hasIndex) return false;
-        // 必须同时具备 element / component / render / children 之一
-        // 防止把带有 path prop 的普通组件（Link、面包屑等）误判为 Route
         return (
+            typeof p.path === 'string' ||
+            // React Router v5 支持 path 为数组：<Route path={['/login', '/signup']} />
+            (Array.isArray(p.path) && p.path.length > 0) ||
+            p.index === true ||
             p.element !== undefined ||
             typeof p.component === 'function' ||
             typeof p.render === 'function' ||
-            p.children !== undefined
+            typeof p.lazy === 'function' ||
+            // React Router v5 的 Redirect：<Redirect to="/login" from="/old" />
+            // 没有 path，但有 to（目标）或 from（来源）
+            typeof p.to === 'string' ||
+            typeof p.from === 'string'
         );
     }
 
@@ -256,7 +268,10 @@
 
         const queue = [startFiber];
         const visited = new WeakSet();
-        const MAX_NODES = 3000;
+        // 企业级 React 应用组件数量庞大，且 Routes 可能藏在某个 sibling 子树深处。
+        // BFS 必须先遍历完 sibling 之前所有子树才能到达目标，
+        // 3000 对复杂应用往往不够用，提升到 15000 覆盖更多场景。
+        const MAX_NODES = 15000;
         let count = 0;
         let jsxRoutesCandidate = null; // JSX Routes 命中时不立刻返回，保存为候选
 
@@ -372,13 +387,40 @@
             const p = sub.props;
             if (!p) continue;
 
-            const fullPath = joinPath(prefix, p.path);
+            let routePrefix = prefix; // 子路由递归时使用的 base path
+
             if (typeof p.path === 'string') {
+                // 常规字符串 path
+                const fullPath = joinPath(prefix, p.path);
                 list.push({ name: '', path: fullPath });
+                routePrefix = fullPath;
+            } else if (Array.isArray(p.path) && p.path.length > 0) {
+                // React Router v5：path 可为数组，如 <Route path={['/login', '/signup']} />
+                // 每个路径单独展开为一条路由
+                for (const singlePath of p.path) {
+                    if (typeof singlePath === 'string') {
+                        list.push({ name: '', path: joinPath(prefix, singlePath) });
+                    }
+                }
+                // 子路由以数组第一个 path 为 base
+                if (typeof p.path[0] === 'string') {
+                    routePrefix = joinPath(prefix, p.path[0]);
+                }
+            } else {
+                // React Router v5 Redirect：没有 path，但有 from / to
+                // from 是来源路径（用户可访问的路径）
+                // to  是目标路径（catch-all 时用于表示默认落地页）
+                if (typeof p.from === 'string') {
+                    list.push({ name: '(redirect)', path: joinPath(prefix, p.from) });
+                }
+                if (typeof p.to === 'string') {
+                    list.push({ name: '(redirect→)', path: joinPath(prefix, p.to) });
+                }
             }
-            // 递归处理嵌套 Route
+
+            // 递归处理嵌套 Route（带布局路由的情况）
             if (p.children) {
-                list.push(...extractJSXRoutes(p, fullPath));
+                list.push(...extractJSXRoutes(p, routePrefix));
             }
         }
         return list;
